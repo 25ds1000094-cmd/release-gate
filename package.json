@@ -1,0 +1,13 @@
+{
+  "name": "tds-ga7-release-gate",
+  "version": "1.0.0",
+  "description": "TDS GA7 deterministic CI/CD container release gate",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
