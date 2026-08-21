@@ -5,12 +5,12 @@ on:
     branches:
       - main
 
-permissions:
-  contents: read
-
 jobs:
   release-gate-test:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
 
     steps:
       - name: TDS identity: 25ds1000094@ds.study.iitm.ac.in
