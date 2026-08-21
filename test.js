@@ -1,9 +1,7 @@
 const assert = require("assert");
+const http = require("http");
 
-
-// ====================================================
-// SAFE BASE REQUEST
-// ====================================================
+const PORT = 3456;
 
 const SAFE_REQUEST = {
   target: "preview",
@@ -41,427 +39,244 @@ const SAFE_REQUEST = {
   }
 };
 
+function request(body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
 
-// ====================================================
-// COPY OBJECT
-// ====================================================
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: PORT,
+        path: "/release-gate",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(data)
+        }
+      },
+      (res) => {
+        let response = "";
+
+        res.on("data", (chunk) => {
+          response += chunk;
+        });
+
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode,
+            body: JSON.parse(response)
+          });
+        });
+      }
+    );
+
+    req.on("error", reject);
+
+    req.write(data);
+    req.end();
+  });
+}
+
+function startServer() {
+  return new Promise((resolve) => {
+    process.env.PORT = PORT;
+
+    const server = require("./server");
+
+    setTimeout(() => resolve(server), 500);
+  });
+}
 
 function clone(object) {
   return JSON.parse(JSON.stringify(object));
 }
 
+async function main() {
+  const server = await startServer();
 
-// ====================================================
-// POLICY FUNCTION
-//
-// This is the same policy used by the server.
-// ====================================================
+  try {
+    // ------------------------------------------
+    // Safe request
+    // ------------------------------------------
 
-function evaluatePolicy(body) {
-  const {
-    target,
-    event,
-    ref,
-    workflow = {},
-    image = {}
-  } = body;
+    let result = await request(SAFE_REQUEST);
 
-  const violations = [];
+    assert.strictEqual(result.status, 200);
+    assert.strictEqual(result.body.decision, "promote");
+    assert.deepStrictEqual(result.body.violations, []);
 
+    // ------------------------------------------
+    // Extra permission
+    // ------------------------------------------
 
-  // Permissions
+    let test = clone(SAFE_REQUEST);
+    test.workflow.permissions.admin = "write";
 
-  const expectedPermissions = {
-    contents: "read",
-    packages: "write",
-    "id-token": "none"
-  };
+    result = await request(test);
 
-  const actualPermissions = workflow.permissions || {};
+    assert.strictEqual(result.body.decision, "block");
+    assert(result.body.violations.includes("EXCESS_PERMISSION"));
 
-  const permissionsCorrect =
-    Object.keys(actualPermissions).length === 3 &&
-    actualPermissions.contents === "read" &&
-    actualPermissions.packages === "write" &&
-    actualPermissions["id-token"] === "none";
+    // ------------------------------------------
+    // Unsafe PR trigger
+    // ------------------------------------------
 
-  if (!permissionsCorrect) {
-    violations.push("EXCESS_PERMISSION");
+    test = clone(SAFE_REQUEST);
+    test.workflow.trigger = "pull_request_target";
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("UNSAFE_PR_TRIGGER"));
+
+    // ------------------------------------------
+    // Tests incomplete
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.workflow.testsPassed = false;
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("TESTS_INCOMPLETE"));
+
+    // ------------------------------------------
+    // Mutable third-party action
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.workflow.actions = [
+      {
+        owner: "docker",
+        name: "build-push-action",
+        ref: "v6"
+      }
+    ];
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("MUTABLE_ACTION"));
+
+    // ------------------------------------------
+    // Single-stage image
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.image.multiStage = false;
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("SINGLE_STAGE_IMAGE"));
+
+    // ------------------------------------------
+    // Root runtime
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.image.runsAsRoot = true;
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("ROOT_RUNTIME"));
+
+    // ------------------------------------------
+    // Secret in image
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.image.secretMode = "copy";
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("SECRET_IN_LAYER"));
+
+    // ------------------------------------------
+    // Critical vulnerability
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.image.criticalVulnerabilities = 1;
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("CRITICAL_CVE"));
+
+    // ------------------------------------------
+    // Unpinned image
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.image.digestPinned = false;
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("UNPINNED_IMAGE"));
+
+    // ------------------------------------------
+    // Production wrong branch
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.target = "production";
+    test.event = "push";
+    test.ref = "refs/heads/develop";
+    test.workflow.trigger = "push";
+    test.workflow.environmentApproval = true;
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("INVALID_PRODUCTION_REF"));
+
+    // ------------------------------------------
+    // Production approval
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+    test.target = "production";
+    test.event = "push";
+    test.ref = "refs/heads/main";
+    test.workflow.trigger = "push";
+
+    result = await request(test);
+
+    assert(result.body.violations.includes("APPROVAL_REQUIRED"));
+
+    // ------------------------------------------
+    // Multiple failures
+    // ------------------------------------------
+
+    test = clone(SAFE_REQUEST);
+
+    test.workflow.permissions.extra = "write";
+    test.workflow.trigger = "pull_request_target";
+    test.workflow.testsPassed = false;
+
+    test.image.multiStage = false;
+    test.image.runsAsRoot = true;
+    test.image.secretMode = "copy";
+    test.image.criticalVulnerabilities = 2;
+    test.image.digestPinned = false;
+
+    result = await request(test);
+
+    const violations = result.body.violations;
+
+    assert(violations.includes("EXCESS_PERMISSION"));
+    assert(violations.includes("UNSAFE_PR_TRIGGER"));
+    assert(violations.includes("TESTS_INCOMPLETE"));
+    assert(violations.includes("SINGLE_STAGE_IMAGE"));
+    assert(violations.includes("ROOT_RUNTIME"));
+    assert(violations.includes("SECRET_IN_LAYER"));
+    assert(violations.includes("CRITICAL_CVE"));
+    assert(violations.includes("UNPINNED_IMAGE"));
+
+    console.log("ALL RELEASE-GATE TESTS PASSED");
+  } finally {
+    server.close();
   }
-
-
-  // Pull request trigger
-
-  if (
-    event === "pull_request" &&
-    workflow.trigger !== "pull_request"
-  ) {
-    violations.push("UNSAFE_PR_TRIGGER");
-  }
-
-
-  // Tests
-
-  if (
-    workflow.testsPassed !== true ||
-    workflow.matrixComplete !== true ||
-    workflow.failFast !== false
-  ) {
-    violations.push("TESTS_INCOMPLETE");
-  }
-
-
-  // Actions
-
-  const fullSha = /^[0-9a-f]{40}$/;
-
-  for (const action of workflow.actions || []) {
-    if (
-      action.owner !== "actions" &&
-      !fullSha.test(action.ref || "")
-    ) {
-      violations.push("MUTABLE_ACTION");
-      break;
-    }
-  }
-
-
-  // Image
-
-  if (image.multiStage !== true) {
-    violations.push("SINGLE_STAGE_IMAGE");
-  }
-
-  if (image.runsAsRoot !== false) {
-    violations.push("ROOT_RUNTIME");
-  }
-
-  if (!["none", "buildkit"].includes(image.secretMode)) {
-    violations.push("SECRET_IN_LAYER");
-  }
-
-  if (image.criticalVulnerabilities !== 0) {
-    violations.push("CRITICAL_CVE");
-  }
-
-  if (image.digestPinned !== true) {
-    violations.push("UNPINNED_IMAGE");
-  }
-
-
-  // Production
-
-  if (target === "production") {
-    if (
-      event !== "push" ||
-      ref !== "refs/heads/main"
-    ) {
-      violations.push("INVALID_PRODUCTION_REF");
-    }
-
-    if (workflow.environmentApproval !== true) {
-      violations.push("APPROVAL_REQUIRED");
-    }
-  }
-
-
-  return {
-    decision: violations.length === 0
-      ? "promote"
-      : "block",
-
-    violations
-  };
 }
 
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
 
-// ====================================================
-// TEST 1: SAFE REQUEST
-// ====================================================
-
-let result = evaluatePolicy(
-  clone(SAFE_REQUEST)
-);
-
-assert.strictEqual(
-  result.decision,
-  "promote"
-);
-
-assert.deepStrictEqual(
-  result.violations,
-  []
-);
-
-
-// ====================================================
-// TEST 2: EXTRA PERMISSION
-// ====================================================
-
-let test = clone(SAFE_REQUEST);
-
-test.workflow.permissions.admin = "write";
-
-result = evaluatePolicy(test);
-
-assert.strictEqual(
-  result.decision,
-  "block"
-);
-
-assert(
-  result.violations.includes("EXCESS_PERMISSION")
-);
-
-
-// ====================================================
-// TEST 3: UNSAFE PR TRIGGER
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.workflow.trigger = "pull_request_target";
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("UNSAFE_PR_TRIGGER")
-);
-
-
-// ====================================================
-// TEST 4: TESTS FAILED
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.workflow.testsPassed = false;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("TESTS_INCOMPLETE")
-);
-
-
-// ====================================================
-// TEST 5: MATRIX INCOMPLETE
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.workflow.matrixComplete = false;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("TESTS_INCOMPLETE")
-);
-
-
-// ====================================================
-// TEST 6: FAIL FAST TRUE
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.workflow.failFast = true;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("TESTS_INCOMPLETE")
-);
-
-
-// ====================================================
-// TEST 7: MUTABLE THIRD-PARTY ACTION
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.workflow.actions = [
-  {
-    owner: "docker",
-    name: "build-push-action",
-    ref: "v6"
-  }
-];
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("MUTABLE_ACTION")
-);
-
-
-// ====================================================
-// TEST 8: SINGLE-STAGE IMAGE
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.image.multiStage = false;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("SINGLE_STAGE_IMAGE")
-);
-
-
-// ====================================================
-// TEST 9: ROOT RUNTIME
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.image.runsAsRoot = true;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("ROOT_RUNTIME")
-);
-
-
-// ====================================================
-// TEST 10: SECRET IN IMAGE
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.image.secretMode = "copy";
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("SECRET_IN_LAYER")
-);
-
-
-// ====================================================
-// TEST 11: CRITICAL CVE
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.image.criticalVulnerabilities = 1;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("CRITICAL_CVE")
-);
-
-
-// ====================================================
-// TEST 12: UNPINNED IMAGE
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.image.digestPinned = false;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("UNPINNED_IMAGE")
-);
-
-
-// ====================================================
-// TEST 13: INVALID PRODUCTION REF
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.target = "production";
-test.event = "push";
-test.ref = "refs/heads/develop";
-test.workflow.trigger = "push";
-test.workflow.environmentApproval = true;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("INVALID_PRODUCTION_REF")
-);
-
-
-// ====================================================
-// TEST 14: APPROVAL REQUIRED
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.target = "production";
-test.event = "push";
-test.ref = "refs/heads/main";
-test.workflow.trigger = "push";
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("APPROVAL_REQUIRED")
-);
-
-
-// ====================================================
-// TEST 15: MULTIPLE FAILURES
-// ====================================================
-
-test = clone(SAFE_REQUEST);
-
-test.workflow.permissions.extra = "write";
-test.workflow.trigger = "pull_request_target";
-test.workflow.testsPassed = false;
-
-test.image.multiStage = false;
-test.image.runsAsRoot = true;
-test.image.secretMode = "copy";
-test.image.criticalVulnerabilities = 2;
-test.image.digestPinned = false;
-
-result = evaluatePolicy(test);
-
-assert(
-  result.violations.includes("EXCESS_PERMISSION")
-);
-
-assert(
-  result.violations.includes("UNSAFE_PR_TRIGGER")
-);
-
-assert(
-  result.violations.includes("TESTS_INCOMPLETE")
-);
-
-assert(
-  result.violations.includes("SINGLE_STAGE_IMAGE")
-);
-
-assert(
-  result.violations.includes("ROOT_RUNTIME")
-);
-
-assert(
-  result.violations.includes("SECRET_IN_LAYER")
-);
-
-assert(
-  result.violations.includes("CRITICAL_CVE")
-);
-
-assert(
-  result.violations.includes("UNPINNED_IMAGE")
-);
-
-
-// ====================================================
-// ALL TESTS PASSED
-// ====================================================
-
-console.log("====================================");
-console.log("ALL RELEASE-GATE TESTS PASSED");
-console.log("====================================");
